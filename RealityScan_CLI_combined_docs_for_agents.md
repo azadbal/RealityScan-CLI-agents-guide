@@ -1,604 +1,386 @@
-## Agent Overview
+# RealityScan / RealityCapture Agent Operations Guide
 
-This top section is a distilled agent-facing guide synthesized from the official RealityScan / RealityCapture CLI docs. It is intended to give an agent the operating model first, before the merged raw help reference below.
+This top section is the agent-first playbook. It is written for an agent that needs to use RealityScan / RealityCapture to complete work, not just recite command syntax. The goal is to explain the practical operating model, the major workflows, the hidden state that matters, and when GUI-exported parameter files are part of the real CLI workflow.
 
-# RealityScan / RealityCapture CLI & RCCMD Knowledge Map
-
-This document is a **mental model + reference map** distilled from the official RealityScan / RealityCapture CLI PDFs. It is intended to onboard another agent (human or AI) so they can reliably help write, reason about, and debug CLI and `.rscmd/.rccmd` workflows.
-
-The focus is **how the system actually behaves**, not just command lists.
+The full merged official help remains below as the exhaustive reference.
 
 ---
 
-## 1. High-level execution model
+## 1. Core Operating Model
 
-RealityScan / RealityCapture CLI is **imperative and sequential**.
+RealityScan CLI is a stateful control surface for the application.
 
-* The executable is invoked once.
-* Commands are executed **in the exact order provided**.
-* Each command mutates internal application state (scene, components, selection, settings).
-* Later commands implicitly depend on earlier state.
+* Commands execute in order.
+* Each command changes application state.
+* Later commands depend on the scene, selection, and settings created by earlier commands.
+* There is no dependency graph, rollback, or safety layer.
 
-This means:
+The important consequence is that correct command spelling is only part of the job. The bigger issue is whether the application is in the right state when a command runs.
 
-* There is **no DAG** or dependency resolution.
-* There is **no rollback**.
-* If a command fails, later commands may run on invalid state unless error handling is enabled.
+Think in terms of:
 
-CLI is effectively a macro recorder for the GUI.
-
----
-
-## 2. Three ways to issue commands
-
-### 2.1 Direct CLI invocation
-
-```bash
-RealityScan.exe -newScene -addFolder "images" -align -save "scene.rsproj"
-```
-
-* Suitable for short, one-shot runs
-* Hard to maintain for pipelines
-
-### 2.2 `.rscmd` / `.rccmd` script files (core mechanism)
-
-A plain-text file containing one command per line:
-
-```txt
-# comments allowed
--newScene
--addFolder "images"
--align
--save "scene.rsproj"
-```
-
-Executed via:
-
-```bash
-RealityScan.exe -execRSCMD "script.rccmd"
-```
-
-Key properties:
-
-* No flow control (no if/loops)
-* No variables except positional args
-* No concept of script directory
-
-This is the **primary automation primitive**.
-
-### 2.3 Delegation to a running instance
-
-Commands can be sent to a named, already-running instance.
-
-Used for:
-
-* Long-running background jobs
-* Multi-instance orchestration
-* External schedulers
+* current project
+* loaded inputs
+* selected images
+* selected component
+* selected model
+* current reconstruction region
+* current settings and exported parameter files
 
 ---
 
-## 3. Working directory and paths (important)
+## 2. Task-to-Command Cheatsheet
 
-* **Relative paths are resolved against the process working directory**, not the `.rccmd` file location.
-* There is **no token** like `$SCRIPT_DIR` or `%~dp0` inside `.rccmd`.
+Use this as the fast entry point.
 
-Implications:
-
-* Always launch RealityScan from a wrapper (`.bat`, shell script) that `cd`s into a known directory.
-* Or pass absolute paths via arguments.
-
-Example wrapper pattern:
-
-```bat
-cd /d "%~dp0"
-RealityScan.exe -execRSCMD "pipeline.rccmd"
-```
+* Create a project from images: `-newScene`, `-add` or `-addFolder`, then `-align`, then `-save`.
+* Reuse or inspect alignment: align first, then use component selection plus `-exportRegistration`, `-exportXMP`, or component export commands.
+* Build a mesh: select the intended component, define the reconstruction region, then run `-calculatePreviewModel`, `-calculateNormalModel`, or `-calculateHighModel`.
+* Export a final model: ensure the correct model is selected, then use `-exportModel` or `-exportSelectedModel` with an exported `params.xml` when needed.
+* Generate ortho deliverables: compute or select a model, use `-calculateOrthoProjection` with a `.rcortho` file, then export with `-exportOrthoProjection`.
+* Run unattended: use `-silent`, `-writeProgress` or `-printProgress`, and set `appQuitOnError=true`.
+* Run multiple jobs in parallel: use named instances and delegation commands only after the single-instance workflow is already correct.
 
 ---
 
-## 4. Arguments and parameterization
+## 3. State Dependencies That Matter
 
-`.rscmd/.rccmd` supports **positional arguments**:
+Most failures come from valid commands running against the wrong state.
 
-* `$(arg1)` ... `$(arg9)`
+* Alignment creates components.
+* Reconstruction uses the selected component.
+* Model tools operate on the selected or most recently created model.
+* Some exports use selected images.
+* Many import/export commands depend on GUI-exported parameter files.
+* Loading a project changes almost all downstream assumptions.
 
-Passed at execution time:
+Before writing any sequence, ask:
 
-```bash
-RealityScan.exe -execRSCMD pipeline.rccmd images output
-```
-
-```txt
--addFolder "$(arg1)"
--save "$(arg2)\\scene.rsproj"
-```
-
-There are:
-
-* No named arguments
-* No defaults
-* No type checking
-
-Arguments are **string substitution only**.
+1. What project is loaded right now?
+2. What input data is present?
+3. What is selected?
+4. Which command changes selection?
+5. Which external parameter file is required?
 
 ---
 
-## 5. Project & scene lifecycle
+## 4. Agent Workflow Lifecycle
 
-### Core scene commands
+For most tasks, the reliable workflow is:
 
-* `-newScene` - resets everything
-* `-load <project>` - loads existing project
-* `-save <project>` - saves current state
+1. Start or load a project.
+2. Ingest images, scans, or other inputs.
+3. Apply settings and presets required for the next computation.
+4. Align inputs and inspect resulting components.
+5. Select the correct component explicitly.
+6. Define or import the reconstruction region.
+7. Compute one or more models.
+8. Post-process the model if needed.
+9. Export the required deliverables.
+10. Save, monitor progress, and quit cleanly.
 
-Rules:
-
-* Many commands require a loaded or new scene
-* Loading implicitly discards unsaved state
-
----
-
-## 6. Input ingestion
-
-### Image input
-
-* `-add <file>` - single image
-* `-addFolder <folder>` - recursive image add
-
-Additional capabilities:
-
-* Enable/disable images
-* Masking
-* Layer selection
-
-All ingestion affects **current scene only**.
+If a workflow goes wrong, trace it back along that chain.
 
 ---
 
-## 7. Settings system (critical distinction)
+## 5. Project and Input Preparation
 
-There are **two fundamentally different setting mechanisms**.
+Start by establishing a clean scene context.
 
-### 7.1 `-set` (runtime state)
+Core scene commands:
+
+* `-newScene`
+* `-load <project>`
+* `-save <project>`
+* `-quit`
+
+Primary input categories:
+
+* images via `-add` or `-addFolder`
+* video frame extraction via `-importVideo`
+* BLK3D via `-importLeicaBlk3D`
+* LiDAR via `-importLaserScan` or `-importLaserScanFolder`
+* HDR imagery via `-importHDRimages`
+* cache reuse via `-importCache`
+
+Supporting preparation tools:
+
+* image selection commands
+* masks via `-setImageLayer`, `-setImagesLayer`, or `-exportMasks`
+* image enable/disable selection edits
+
+Operational rule:
+
+* Treat ingestion as scene setup, not an afterthought. Bad input selection or wrong masks often produce downstream failures that look like alignment or reconstruction problems.
+
+---
+
+## 6. Alignment and Component Management
+
+Alignment is the first major decision point in most workflows.
+
+Core alignment commands:
+
+* `-detectFeatures`
+* `-align`
+* `-draft`
+* `-update`
+* `-mergeComponents`
+
+What alignment produces:
+
+* one or more components
+* camera poses and calibration
+* sparse reconstruction state used by later steps
+
+Critical agent rule:
+
+* After alignment, explicitly choose the component you want to work on.
+
+Common component commands:
+
+* `-selectMaximalComponent`
+* `-selectComponent`
+* `-selectComponentWithLeastReprojectionError`
+* `-renameSelectedComponent`
+* `-deleteSelectedComponent`
+* component import/export commands
+
+Additional alignment-adjacent tools:
+
+* control points
+* ground control points
+* control point measurements
+* marker detection
+* flight log import
+
+Key exports from this stage:
+
+* `-exportRegistration`
+* `-exportXMP`
+* `-exportSparsePointCloud`
+* component export commands
+
+This is where many agent workflows succeed or fail. If the wrong component remains selected, every later step can be technically valid and still produce the wrong result.
+
+---
+
+## 7. Reconstruction Region and Model Computation
+
+Reconstruction is not just "run a mesh command." It is constrained by both component selection and region definition.
+
+Core reconstruction dependencies:
+
+* selected component
+* current reconstruction region
+
+Common region operations:
+
+* auto-create region
+* import region from `.rsbox`
+* export region to `.rsbox`
+* scale, move, rotate, and offset region
+* define region from control points
+
+Practical guidance:
+
+* Do not rely on leftover GUI region state.
+* If reproducibility matters, export and reuse `.rsbox`.
+* If the mesh is clipped, empty, or focused on the wrong area, inspect region state before changing meshing settings.
+
+Core model computation commands:
+
+* `-calculatePreviewModel`
+* `-calculateNormalModel`
+* `-calculateHighModel`
+* `-continueModelCalculation`
+
+Performance and execution notes:
+
+* These are blocking operations.
+* They are often the most expensive part of the workflow.
+* GPU/CPU behavior and cache reuse can materially affect throughput.
+
+---
+
+## 8. Model Processing and Deliverables
+
+After a model exists, RealityScan can produce many different downstream outputs. This is the main deliverable surface area for an agent.
+
+Common post-processing actions:
+
+* simplify
+* smooth
+* texture
+* unwrap
+* mesh cleanup and cutting
+
+Model import/export surface:
+
+* `-importModel`
+* `-exportModel`
+* `-exportSelectedModel`
+* `-exportModelToZip`
+
+Additional deliverables available through model tools:
+
+* orthographic projections
+* cross sections
+* contours
+* shapes
+* depth and mask export
+* camera snapshots
+* linear LoD export
+* Cesium 3D Tiles export
+* classification workflows
+
+Important selection rule:
+
+* Many of these commands operate on the selected model or selected ortho object. If you are exporting the wrong artifact, confirm the current selection before changing export settings.
+
+---
+
+## 9. Settings, Presets, and Parameter Artifacts
+
+There are three different configuration layers an agent needs to understand.
+
+### Runtime state via `-set`
+
+Use `-set` for session behavior and toggles that can change during the current run.
+
+Example:
 
 ```txt
 -set "appQuitOnError=true"
 ```
 
-* Affects current session only
-* Can be changed anytime
-* Lost when app exits
+### Setup-sensitive configuration via `-preset`
 
-### 7.2 `-preset` (pre-processing / setup)
+Use `-preset` for settings that affect how the next major computation is performed and may require setup-phase application.
+
+Example:
 
 ```txt
 -preset "alignmentQuality=High"
 ```
 
-* Must be applied **before** the relevant computation
-* Mirrors GUI preset changes
-* Affects how future operations behave
+Rule:
 
-Key rule:
+* If the setting changes how alignment or reconstruction is computed, treat `-preset` as the safer default unless the docs clearly say otherwise.
 
-> If a setting affects how alignment / reconstruction is *computed*, it must be a `preset`, not `set`.
+### GUI-exported parameter files
 
----
+Many important CLI commands rely on files exported from GUI dialogs.
 
-## 8. Alignment and components
+Common examples:
 
-### Alignment commands
+* `params.xml` for registration, model export, point clouds, masks, LiDAR import, and many other dialogs
+* `.rsbox` for reconstruction region reuse
+* `.rcortho` for orthographic projection setup
+* `.rsconfig` for global settings import/export
 
-* `-detectFeatures`
-* `-align`
+Operational rule:
 
-Alignment creates **components**.
-
-### Component handling
-
-* Multiple components may exist
-* Many downstream commands operate on the **selected component**
-
-Common selection commands:
-
-* `-selectMaximalComponent`
-* `-selectComponent <id>`
-
-Failing to select a component is a **common source of silent failure**.
+* A complete agent workflow often includes "configure once in the GUI, export the parameter file, then reuse it in CLI." That is normal and should be documented as part of the workflow, not treated as an edge case.
 
 ---
 
-## 9. Registration & camera exports
+## 10. Reliability, Headless Use, and Monitoring
 
-Registration export is unified:
+For unattended execution, command correctness is not enough. You also need observability and failure control.
 
-```txt
--exportRegistration <output> <params.xml>
-```
+Key commands and settings:
 
-Key idea:
-
-* **Format is not chosen in CLI**
-* Format is defined in the **Export Registration XML**
-
-COLMAP, XMP, internal formats all use the same command.
-
-Workflow:
-
-1. Configure export once in GUI
-2. Save settings XML
-3. Reuse via CLI
-
----
-
-## 10. Reconstruction region
-
-Reconstruction is **region-bounded**.
-
-Region commands:
-
-* Auto-generate region
-* Import/export region
-* Scale / rotate / move
-
-Best practice:
-
-* Explicitly define region before reconstruction
-* Do not rely on GUI leftovers
-
----
-
-## 11. Reconstruction (meshing)
-
-Three main compute commands:
-
-* `-calculatePreviewModel`
-* `-calculateNormalModel`
-* `-calculateHighModel`
-
-Properties:
-
-* Blocking operations
-* Heavy GPU/CPU usage
-* Can be resumed with `-continueModelCalculation`
-
-Reconstruction always applies to:
-
-* Selected component
-* Current reconstruction region
-
----
-
-## 12. Model tools (post-processing)
-
-Operate on the **currently active model**:
-
-* Simplify
-* Smooth
-* Cut
-* Unwrap
-* Texture
-* Export model
-
-These are destructive unless saved as new models.
-
----
-
-## 13. Error handling & observability
-
-### Silent / headless operation
-
-```txt
--silent "crash_reports"
-```
-
-Prevents dialogs and UI blocks.
-
-### Progress reporting
-
-* `-printProgress`
+* `-silent "crash_reports"`
 * `-writeProgress <file>`
-
-### Failure control
-
+* `-printProgress`
+* `-tag`
+* `-stdConsole`
 * `-set "appQuitOnError=true"`
 
-Without this, failures may not stop execution.
+What these are for:
+
+* suppressing interactive dialogs
+* writing machine-readable progress to disk
+* surfacing progress in the console
+* making batch runs fail fast
+
+Common operational risks:
+
+* hidden dialogs blocking a headless run
+* autosave handling changing load behavior
+* failures that do not stop later commands
+* long calculations with no progress reporting
 
 ---
 
-## 14. Delegation & multi-instance control
+## 11. Advanced Orchestration
 
-### Instance naming
+Multi-instance control is useful, but it should be treated as an advanced layer after the single-instance workflow is already correct.
 
-```txt
--setInstanceName worker1
-```
+Core orchestration commands:
 
-### Delegation
-
-```txt
--delegateTo worker1 -align
-```
-
-### Synchronization
-
+* `-setInstanceName`
+* `-delegateTo`
 * `-waitCompleted`
 * `-getStatus`
+* `-pauseInstance`
+* `-unpauseInstance`
 * `-abortInstance`
 
-Used for:
+Use cases:
 
-* Job queues
-* Farm-like orchestration
-* External schedulers
+* job queues
+* farm-like dispatch
+* coordinating long-running background jobs
 
----
+Practical rule:
 
-## 15. Commands outside command prompt
-
-Some operations:
-
-* Rely on OS integration
-* Are triggered by drag-drop or file association
-
-CLI generally bypasses these.
+* First make the workflow work in one instance with direct commands. Then layer delegation on top.
 
 ---
 
-## 16. Common failure modes
+## 12. Automation Wrappers: `.rscmd` / `.rccmd`
 
-* Forgetting `-selectMaximalComponent`
-* Using `-set` instead of `-preset`
-* Relative paths resolving incorrectly
-* Export commands relying on GUI state not recreated in CLI
-* Assuming formats are CLI flags (they are not)
+These are useful wrappers for batching commands, but they are not the main conceptual model for understanding RealityScan.
 
----
+What they are good for:
 
-## 17. Mental model summary
+* packaging repeatable command sequences
+* letting a human or script invoke a stored workflow
+* passing simple positional arguments into a reusable command file
 
-Think of RealityScan CLI as:
+Important behavior:
 
-> A deterministic, stateful, single-threaded macro engine that replays GUI actions exactly as if a user clicked them - nothing more, nothing less.
+* commands inside still execute sequentially
+* arguments are string substitution only
+* relative paths resolve from the process working directory, not the command file location
+* there is no flow control or script-local environment model
 
-There is:
-
-* No abstraction layer
-* No schema validation
-* No smart defaults
-
-Correct automation comes from:
-
-* Explicit state setup
-* Explicit selection
-* Saved XML parameter reuse
-* External wrappers for structure
+Use them when a stored command sequence is convenient. Do not mistake them for a separate execution engine.
 
 ---
 
-## 18. How to help write commands effectively
+## 13. How to Use the Full Reference Below
 
-When helping with CLI:
+Use the curated playbook above for workflow design and failure diagnosis.
 
-Always ask:
+Use the official merged reference below when you need:
 
-1. What scene state exists at this point?
-2. What is currently selected?
-3. Which settings must be presets vs runtime?
-4. Which GUI dialog defines this behavior?
-5. Is there a saved XML for this operation?
+* the exact command name
+* required and optional parameters
+* full command tables
+* topic-specific examples from the original docs
 
-If those are answered, the CLI command sequence is usually trivial.
+Fast lookup guide:
 
----
-
-## 19. PDF-to-Concept Mapping (How to Use the Source Documents)
-
-This section maps **each official PDF** to the concepts and responsibilities it covers, so a new agent knows exactly **where to look** when answering a specific type of question.
-
----
-
-### 1. *Command Line Interface - RealityScan Help.pdf*
-
-**Primary role:**
-
-* Entry point and mental model of the CLI
-
-**Covers:**
-
-* How CLI commands are structured
-* How commands are passed to the executable
-* How `.rscmd/.rccmd` files are executed
-* Sequential execution model
-
-**Use this PDF when:**
-
-* Explaining how the CLI fundamentally works
-* Answering "can the CLI do X at all?"
-* Clarifying syntax rules and invocation patterns
-
----
-
-### 2. *List of All CLI Commands - RealityScan Help.pdf*
-
-**Primary role:**
-
-* Master index of available commands
-
-**Covers:**
-
-* Every CLI command name
-* Short descriptions of each command
-
-**Use this PDF when:**
-
-* Verifying whether a command exists
-* Finding the exact command spelling
-* Discovering adjacent or related commands
-
-**Not sufficient by itself** for correct usage - must be paired with domain PDFs below.
-
----
-
-### 3. *Settings' Commands - RealityScan Help.pdf*
-
-**Primary role:**
-
-* Configuration control
-
-**Covers:**
-
-* `-set` vs `-preset`
-* Runtime vs pre-processing settings
-* Coordinate systems
-* Reset behaviors
-
-**Use this PDF when:**
-
-* A command "does nothing" due to wrong setting scope
-* Translating GUI presets into CLI
-* Tuning alignment or reconstruction quality
-
----
-
-### 4. *Alignment Commands - RealityScan Help.pdf*
-
-**Primary role:**
-
-* Camera alignment and component generation
-
-**Covers:**
-
-* Feature detection
-* Alignment execution
-* Component creation and selection
-* Control points and camera grouping
-
-**Use this PDF when:**
-
-* Working with camera poses
-* Exporting registrations
-* Debugging multi-component results
-* Preparing data for COLMAP / Nerfstudio / SfM pipelines
-
----
-
-### 5. *Reconstruction Commands - RealityScan Help.pdf*
-
-**Primary role:**
-
-* Meshing and reconstruction
-
-**Covers:**
-
-* Reconstruction region tools
-* Preview / Normal / High model computation
-* Resume and continuation
-
-**Use this PDF when:**
-
-* Automating mesh generation
-* Explaining why a model is empty or clipped
-* Adjusting reconstruction fidelity
-
----
-
-### 6. *Model Tools - RealityScan Help.pdf*
-
-**Primary role:**
-
-* Post-processing meshes
-
-**Covers:**
-
-* Simplification
-* Smoothing
-* Cutting
-* UV unwrap
-* Texturing
-* Model export
-
-**Use this PDF when:**
-
-* Automating mesh cleanup
-* Preparing assets for downstream engines
-* Exporting final geometry
-
----
-
-### 7. *Error-handling Commands - RealityScan Help.pdf*
-
-**Primary role:**
-
-* Robust automation and headless operation
-
-**Covers:**
-
-* Silent mode
-* Crash handling
-* Progress logging
-* Error-triggered termination
-
-**Use this PDF when:**
-
-* Running unattended jobs
-* Building batch pipelines
-* Integrating with schedulers or CI systems
-
----
-
-### 8. *Delegation of Commands - RealityScan Help.pdf*
-
-**Primary role:**
-
-* Multi-instance orchestration
-
-**Covers:**
-
-* Instance naming
-* Delegating commands
-* Waiting, polling, aborting
-
-**Use this PDF when:**
-
-* Running multiple projects in parallel
-* Managing long-running jobs
-* Building farm-like execution
-
----
-
-### 9. *Commands Outside Command Prompt - RealityScan Help.pdf*
-
-**Primary role:**
-
-* OS-level integration edge cases
-
-**Covers:**
-
-* Commands triggered outside standard CLI usage
-* Drag-and-drop behaviors
-
-**Use this PDF when:**
-
-* Reconciling GUI-only behaviors
-* Explaining why some actions are not scriptable
-
----
-
-## 20. How a New Agent Should Navigate the PDFs
-
-If the task is:
-
-* **"Does RC/RS support this?"** -> *List of All CLI Commands*
-* **"Why does this setting not apply?"** -> *Settings' Commands*
-* **"Why is alignment/export wrong?"** -> *Alignment Commands*
-* **"Why is the mesh empty/bad?"** -> *Reconstruction Commands*
-* **"How do I post-process/export models?"** -> *Model Tools*
-* **"How do I make this robust/headless?"** -> *Error-handling Commands*
-* **"How do I run multiple jobs?"** -> *Delegation of Commands*
-* **"What is the CLI actually doing?"** -> *Command Line Interface*
+* Need exact command spelling: go to `List of All CLI Commands`.
+* Need alignment behavior: go to `Alignment Commands`.
+* Need reconstruction-region or meshing details: go to `Reconstruction Commands`.
+* Need model exports and ortho workflows: go to `Model Tools`.
+* Need settings keys and behavior: go to `Settings' Commands`.
+* Need headless and error behavior: go to `Error-handling Commands`.
+* Need delegation or instance control: go to `Delegation of Commands`.
 
 ---
 
